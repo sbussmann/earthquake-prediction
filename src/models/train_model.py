@@ -9,9 +9,53 @@ from sklearn.svm import NuSVR
 
 
 class ModelTrainer(object):
-    def __init__(self, train_features, test_features):
+    def __init__(self, train_features, test_features, label_features):
         self.train_features = train_features
         self.test_features = test_features
+        self.label_features = label_features
+
+        self.folds = None
+
+        self.out_of_fold = np.zeros(len(train_features))
+        self.prediction = np.zeros(len(test_features))
+
+        self.scores = []
+
+    def cross_validation(self):
+        n_fold = 5
+        folds = KFold(n_splits=n_fold, shuffle=True, random_state=11)
+        self.folds = folds
+
+    def train_and_predict(self, model_type, params=None):
+
+        train_features = self.train_features
+        test_features = self.test_features
+        label_features = self.label_features
+        folds = self.folds
+        for fold_n, (train_index, valid_index) in enumerate(folds.split(train_features)):
+            print("Fold", fold_n, "started at", time.ctime())
+            X_train, X_valid = (
+                train_features.iloc[train_index],
+                train_features.iloc[valid_index],
+            )
+            y_train, y_valid = (
+                label_features.iloc[train_index],
+                label_features.iloc[valid_index],
+            )
+
+            ModelFitClass = globals()["{}Fitter".format(model_type)]
+            model_fitter = ModelFitClass(X_train, y_train, X_valid, y_valid, params)
+            model_fitter.fit()
+            model_fitter.predict()
+
+            self.out_of_fold[valid_index] = model_fitter.y_predict_valid.reshape(-1)
+            self.scores.append(model_fitter.score())
+
+            y_predict = model_fitter.predict(test_features)
+
+            self.prediction += y_predict
+
+        self.prediction /= len(folds)
 
 
 class ModelFitter(object):
@@ -59,21 +103,25 @@ class LGBFitter(ModelFitter):
 
 
 class XGBModelFitter(ModelFitter):
-    def __init__(self, X_train, y_train, X_valid, y_valid, params, feature_names):
+    def __init__(self, X_train, y_train, X_valid, y_valid, params):
         ModelFitter.__init__(self, X_train, y_train, X_valid, y_valid, params)
-        self.train_data = xgb.DMatrix(
-            data=X_train, label=y_train, feature_names=feature_names
-        )
-        self.valid_data = xgb.DMatrix(
-            data=X_valid, label=y_valid, feature_names=feature_names
-        )
-        self.feature_names = feature_names
 
     def fit(self):
 
-        watchlist = [(self.train_data, "train"), (self.valid_data, "valid_data")]
+        train_data = xgb.DMatrix(
+            data=self.X_train,
+            label=self.y_train,
+            feature_names=self.params["feature_names"],
+        )
+        valid_data = xgb.DMatrix(
+            data=self.X_valid,
+            label=self.y_valid,
+            feature_names=self.params["feature_names"],
+        )
+
+        watchlist = [(train_data, "train"), (valid_data, "valid_data")]
         model = xgb.train(
-            dtrain=self.train_data,
+            dtrain=train_data,
             num_boost_round=20000,
             evals=watchlist,
             early_stopping_rounds=200,
@@ -85,7 +133,7 @@ class XGBModelFitter(ModelFitter):
     def predict(self):
         model = self.model
         self.y_predict_valid = model.predict(
-            xgb.DMatrix(self.X_valid, feature_names=self.feature_names),
+            xgb.DMatrix(self.X_valid, feature_names=self.params["feature_names"]),
             ntree_limit=model.best_ntree_limit,
         )
 
@@ -121,47 +169,3 @@ class CatBoostFitter(ModelFitter):
     def predict(self):
         model = self.model
         self.y_predict_valid = model.predict(self.X_valid)
-
-
-def cross_validation():
-    n_fold = 5
-    folds = KFold(n_splits=n_fold, shuffle=True, random_state=11)
-    return folds
-
-
-def train_and_predict(
-    train_features, test_features, label_features, folds, model_type, params=None
-):
-
-    out_of_fold = np.zeros(len(train_features))
-    prediction = np.zeros(len(test_features))
-    scores = []
-    for fold_n, (train_index, valid_index) in enumerate(folds.split(train_features)):
-        print("Fold", fold_n, "started at", time.ctime())
-        X_train, X_valid = (
-            train_features.iloc[train_index],
-            train_features.iloc[valid_index],
-        )
-        y_train, y_valid = (
-            label_features.iloc[train_index],
-            label_features.iloc[valid_index],
-        )
-
-        ModelFitClass = globals()["{}Fitter".format(model_type)]
-        model_fitter = ModelFitClass(X_train, y_train, X_valid, y_valid, params)
-        model_fitter.fit()
-        model_fitter.predict()
-
-        out_of_fold[valid_index] = model_fitter.y_predict_valid.reshape(-1)
-        scores.append(model_fitter.score())
-
-        y_predict = model_fitter.predict(test_features)
-
-        prediction += y_predict
-
-    prediction /= len(folds)
-
-    print(
-        "CV mean score: {0:.4f}, std: {1:.4f}.".format(np.mean(scores), np.std(scores))
-    )
-    return out_of_fold, prediction
