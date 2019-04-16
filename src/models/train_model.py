@@ -1,13 +1,126 @@
 import numpy as np
 import time
-import pandas as pd
 import lightgbm as lgb
 import xgboost as xgb
 from catboost import CatBoostRegressor
 from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import KFold
+from sklearn.svm import NuSVR
 
 
+class ModelTrainer(object):
+    def __init__(self, train_features, test_features):
+        self.train_features = train_features
+        self.test_features = test_features
+
+
+class ModelFitter(object):
+    def __init__(self, X_train, y_train, X_valid, y_valid, params):
+        self.X_train = X_train
+        self.y_train = y_train
+        self.X_valid = X_valid
+        self.y_valid = y_valid
+        self.params = params
+
+        self.model = None
+
+        self.y_predict_valid = None
+        self.y_predict = None
+
+        self.score = None
+
+    def score(self):
+        return mean_absolute_error(self.y_valid, self.y_predict_valid)
+
+
+class LGBFitter(ModelFitter):
+    def __init__(self, X_train, y_train, X_valid, y_valid, params):
+        ModelFitter.__init__(self, X_train, y_train, X_valid, y_valid, params)
+
+    def fit(self):
+        model = lgb.LGBMRegressor(**self.params, n_estimators=50000, n_jobs=-1)
+        model.fit(
+            self.X_train,
+            self.y_train,
+            eval_set=[(self.X_train, self.y_train), (self.X_valid, self.y_valid)],
+            eval_metric="mae",
+            verbose=10000,
+            early_stopping_rounds=200,
+        )
+
+        self.model = model
+
+    def predict(self, test_features):
+        model = self.model
+        self.y_predict_valid = model.predict(self.X_valid)
+        self.y_predict = model.predict(
+            test_features, num_iteration=model.best_iteration_
+        )
+
+
+class XGBModelFitter(ModelFitter):
+    def __init__(self, X_train, y_train, X_valid, y_valid, params, feature_names):
+        ModelFitter.__init__(self, X_train, y_train, X_valid, y_valid, params)
+        self.train_data = xgb.DMatrix(
+            data=X_train, label=y_train, feature_names=feature_names
+        )
+        self.valid_data = xgb.DMatrix(
+            data=X_valid, label=y_valid, feature_names=feature_names
+        )
+        self.feature_names = feature_names
+
+    def fit(self):
+
+        watchlist = [(self.train_data, "train"), (self.valid_data, "valid_data")]
+        model = xgb.train(
+            dtrain=self.train_data,
+            num_boost_round=20000,
+            evals=watchlist,
+            early_stopping_rounds=200,
+            verbose_eval=500,
+            params=self.params,
+        )
+        self.model = model
+
+    def predict(self):
+        model = self.model
+        self.y_predict_valid = model.predict(
+            xgb.DMatrix(self.X_valid, feature_names=self.feature_names),
+            ntree_limit=model.best_ntree_limit,
+        )
+
+
+class NuSVRFitter(ModelFitter):
+    def __init__(self, X_train, y_train, X_valid, y_valid, params):
+        ModelFitter.__init__(self, X_train, y_train, X_valid, y_valid, params)
+
+    def fit(self):
+        model = NuSVR(**self.params)
+        model.fit(self.X_train, self.y_train)
+
+    def predict(self):
+        model = self.model
+        self.y_predict_valid = model.predict(self.X_valid).reshape(-1)
+
+
+class CatBoostFitter(ModelFitter):
+    def __init__(self, X_train, y_train, X_valid, y_valid, params):
+        ModelFitter.__init__(self, X_train, y_train, X_valid, y_valid, params)
+
+    def fit(self):
+        model = CatBoostRegressor(iterations=20000, eval_metric="MAE", **self.params)
+        model.fit(
+            self.X_train,
+            self.y_train,
+            eval_set=(self.X_valid, self.y_valid),
+            cat_features=[],
+            use_best_model=True,
+            verbose=False,
+        )
+
+    def predict(self):
+        model = self.model
+        self.y_predict_valid = model.predict(self.X_valid)
 
 
 def cross_validation():
@@ -16,108 +129,35 @@ def cross_validation():
     return folds
 
 
-def lgb_fit(X_train, y_train, X_valid, y_valid, test_features, params):
-    model = lgb.LGBMRegressor(**params, n_estimators=50000, n_jobs=-1)
-    model.fit(
-        X_train,
-        y_train,
-        eval_set=[(X_train, y_train), (X_valid, y_valid)],
-        eval_metric="mae",
-        verbose=10000,
-        early_stopping_rounds=200,
-    )
-
-    y_pred_valid = model.predict(X_valid)
-    y_pred = model.predict(test_features, num_iteration=model.best_iteration_)
-    return y_pred, y_pred_valid
-
-
 def train_and_predict(
-    train_features,
-    test_features,
-    label_features,
-    folds,
-    params=None,
-    model_type="lgb"
+    train_features, test_features, label_features, folds, model_type, params=None
 ):
 
     out_of_fold = np.zeros(len(train_features))
     prediction = np.zeros(len(test_features))
     scores = []
-    feature_importance = pd.DataFrame()
     for fold_n, (train_index, valid_index) in enumerate(folds.split(train_features)):
         print("Fold", fold_n, "started at", time.ctime())
-        X_train, X_valid = train_features.iloc[train_index], train_features.iloc[valid_index]
-        y_train, y_valid = label_features.iloc[train_index], label_features.iloc[valid_index]
+        X_train, X_valid = (
+            train_features.iloc[train_index],
+            train_features.iloc[valid_index],
+        )
+        y_train, y_valid = (
+            label_features.iloc[train_index],
+            label_features.iloc[valid_index],
+        )
 
-        if model_type == "lgb":
-            y_pred, y_pred_valid = lgb_fit(X_train, y_train, X_valid, y_valid, test_features, params)
+        ModelFitClass = globals()["{}Fitter".format(model_type)]
+        model_fitter = ModelFitClass(X_train, y_train, X_valid, y_valid, params)
+        model_fitter.fit()
+        model_fitter.predict()
 
-        if model_type == "xgb":
-            train_data = xgb.DMatrix(
-                data=X_train, label=y_train, feature_names=train_features.columns
-            )
-            valid_data = xgb.DMatrix(
-                data=X_valid, label=y_valid, feature_names=train_features.columns
-            )
+        out_of_fold[valid_index] = model_fitter.y_predict_valid.reshape(-1)
+        scores.append(model_fitter.score())
 
-            watchlist = [(train_data, "train"), (valid_data, "valid_data")]
-            model = xgb.train(
-                dtrain=train_data,
-                num_boost_round=20000,
-                evals=watchlist,
-                early_stopping_rounds=200,
-                verbose_eval=500,
-                params=params,
-            )
-            y_pred_valid = model.predict(
-                xgb.DMatrix(X_valid, feature_names=train_features.columns),
-                ntree_limit=model.best_ntree_limit,
-            )
-            y_pred = model.predict(
-                xgb.DMatrix(test_features, feature_names=train_features.columns),
-                ntree_limit=model.best_ntree_limit,
-            )
+        y_predict = model_fitter.predict(test_features)
 
-        if model_type == "sklearn":
-            model = model
-            model.fit(X_train, y_train)
-
-            y_pred_valid = model.predict(X_valid).reshape(-1)
-            score = mean_absolute_error(y_valid, y_pred_valid)
-            print(f"Fold {fold_n}. MAE: {score:.4f}.")
-            print("")
-
-            y_pred = model.predict(test_features).reshape(-1)
-
-        if model_type == "cat":
-            model = CatBoostRegressor(iterations=20000, eval_metric="MAE", **params)
-            model.fit(
-                X_train,
-                y_train,
-                eval_set=(X_valid, y_valid),
-                cat_features=[],
-                use_best_model=True,
-                verbose=False,
-            )
-
-            y_pred_valid = model.predict(X_valid)
-            y_pred = model.predict(test_features)
-
-        out_of_fold[valid_index] = y_pred_valid.reshape(-1)
-        scores.append(mean_absolute_error(y_valid, y_pred_valid))
-
-        prediction += y_pred
-
-        if model_type == "lgb":
-            # feature importance
-            fold_importance = pd.DataFrame()
-            fold_importance["feature"] = train_features.columns
-            fold_importance["importance"] = model.feature_importances_
-            fold_importance["fold"] = fold_n + 1
-            feature_importance = pd.concat(
-                [feature_importance, fold_importance], axis=0
-            )
+        prediction += y_predict
 
     prediction /= len(folds)
 
