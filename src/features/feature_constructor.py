@@ -1,3 +1,6 @@
+import json
+import os
+import uuid
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
@@ -19,6 +22,9 @@ class FeatureConstructor(object):
 
         self.rows = 150_000
         self.segment_indexes = int(np.floor(train_data.shape[0] / self.rows))
+
+        self.stat_types = None
+
         self.train_features = pd.DataFrame(
             index=range(self.segment_indexes), dtype=np.float64
         )
@@ -35,15 +41,15 @@ class FeatureConstructor(object):
             index=submission_example.index,
         )
         self.test_label = None
-        self.train_scaled_features = None
-        self.test_scaled_features = None
+        self.scaled = None
+        self.uuid = None
 
     def add_train_features(self, stat_types):
         for segment_index in tqdm(range(self.segment_indexes)):
             train_segment = self.train_data.iloc[
                 segment_index * self.rows : segment_index * self.rows + self.rows
             ]
-            self.process_segment(train_segment, segment_index, stat_types)
+            self.process_segment(train_segment, segment_index, stat_types, "train")
 
             time_to_failure = train_segment["time_to_failure"].values[-1]
             self.train_label.loc[segment_index, "time_to_failure"] = time_to_failure
@@ -51,50 +57,92 @@ class FeatureConstructor(object):
     def add_test_features(self, stat_types):
         for segment_index in tqdm(self.test_features.index):
             test_segment = load_data.test_segment(segment_index)
-            self.process_segment(test_segment, segment_index, stat_types)
+            self.process_segment(test_segment, segment_index, stat_types, "test")
 
-    def process_segment(self, segment, segment_index, stat_types):
+    def process_segment(self, segment, segment_index, stat_types, train_or_test):
         acoustic_data = pd.Series(segment["acoustic_data"].values)
         for stat_type in stat_types:
             if stat_type == "add_rolling_stats":
                 for window_size in [10, 100, 1000]:
                     stats_result = globals()[stat_type](acoustic_data, window_size)
                     for stat_key in stats_result:
-                        self.train_features.loc[segment_index, stat_key] = stats_result[
-                            stat_key
-                        ]
+                        if train_or_test == "train":
+                            self.train_features.loc[segment_index, stat_key] = stats_result[
+                                stat_key
+                            ]
+                        else:
+                            self.test_features.loc[segment_index, stat_key] = stats_result[
+                                stat_key
+                            ]
             elif stat_type == "add_n_sigma_stats":
                 stats_result = globals()[stat_type](acoustic_data, n_sigma=3)
                 for stat_key in stats_result:
-                    self.train_features.loc[segment_index, stat_key] = stats_result[
-                        stat_key
-                    ]
+                    if train_or_test == "train":
+                        self.train_features.loc[segment_index, stat_key] = stats_result[
+                            stat_key
+                        ]
+                    else:
+                        self.test_features.loc[segment_index, stat_key] = stats_result[
+                            stat_key
+                        ]
             else:
                 stats_function = globals()[stat_type]
                 stats_result = stats_function(acoustic_data)
                 for stat_key in stats_result:
-                    self.train_features.loc[segment_index, stat_key] = stats_result[
-                        stat_key
-                    ]
+                    if train_or_test == "train":
+                        self.train_features.loc[segment_index, stat_key] = stats_result[
+                            stat_key
+                        ]
+                    else:
+                        self.test_features.loc[segment_index, stat_key] = stats_result[
+                            stat_key
+                        ]
 
-    def add_features(self, stat_types):
+    def add_features(self, stat_types, scaled=True):
         self.add_train_features(stat_types)
         self.add_test_features(stat_types)
+        if scaled:
+            self.use_scaled_features()
+        self.stat_types = stat_types
+        self.scaled = scaled
 
-    def add_scaled_features(self):
+    def use_scaled_features(self):
         standard_scaler = StandardScaler()
         train_features = self.train_features
         standard_scaler.fit(train_features)
         train_scaled_features = pd.DataFrame(
             standard_scaler.transform(train_features), columns=train_features.columns
         )
-        self.train_scaled_features = train_scaled_features
+        self.train_features = train_scaled_features
 
         test_features = self.test_features
         test_scaled_features = pd.DataFrame(
             standard_scaler.transform(test_features), columns=test_features.columns
         )
-        self.test_scaled_features = test_scaled_features
+        self.test_features = test_scaled_features
+
+    def write_features(self):
+        scaled = self.scaled
+        stat_types = self.stat_types
+        uuid1 = uuid.uuid1()
+
+        write_path = os.path.join("data", "interim", "meta-{}.json".format(uuid1))
+        meta_data = {
+            "scaled": scaled,
+            "stat_types": stat_types
+        }
+
+        with open(write_path, "w") as write_file:
+            json.dump(meta_data, write_file)
+
+        train_test = ["train", "test"]
+        for to_process in train_test:
+            write_path = os.path.join("data", "interim", "{}-features-{}.csv".format(to_process, uuid1))
+            self.test_features.to_csv(write_path)
+        write_path = os.path.join("data", "interim", "train-label-{}.csv".format(uuid1))
+        self.train_label.to_csv(write_path)
+
+        self.uuid = uuid1
 
 
 def add_basic_stats(segment):

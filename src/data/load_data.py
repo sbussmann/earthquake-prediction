@@ -26,4 +26,5 @@ def submission_sample():
     data_dir = os.path.join("data")
     submission_path = os.path.join(data_dir, "processed", "sample_submission.csv")
     submission = pd.read_csv(submission_path, index_col='seg_id')
+    submission = submission[::100]
     return submission

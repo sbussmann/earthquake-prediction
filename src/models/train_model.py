@@ -9,30 +9,31 @@ from sklearn.svm import NuSVR
 
 
 class ModelTrainer(object):
-    def __init__(self, train_features, test_features, label_features):
+    def __init__(self, train_features, test_features, train_label, folds):
         self.train_features = train_features
         self.test_features = test_features
-        self.label_features = label_features
+        self.train_label = train_label
 
-        self.folds = None
-
-        self.out_of_fold = np.zeros(len(train_features))
-        self.prediction = np.zeros(len(test_features))
-
-        self.scores = []
-
-    def cross_validation(self):
-        n_fold = 5
-        folds = KFold(n_splits=n_fold, shuffle=True, random_state=11)
         self.folds = folds
+
+        self.out_of_fold = None
+        self.test_prediction = None
+
+        self.fold_scores = None
 
     def train_and_predict(self, model_type, params=None):
 
         train_features = self.train_features
         test_features = self.test_features
-        label_features = self.label_features
+        label_features = self.train_label
         folds = self.folds
-        for fold_n, (train_index, valid_index) in enumerate(folds.split(train_features)):
+
+        out_of_fold = np.zeros(len(train_features))
+        test_prediction = np.zeros(len(test_features))
+        fold_scores = []
+        for fold_n, (train_index, valid_index) in enumerate(
+            folds.split(train_features)
+        ):
             print("Fold", fold_n, "started at", time.ctime())
             X_train, X_valid = (
                 train_features.iloc[train_index],
@@ -43,22 +44,28 @@ class ModelTrainer(object):
                 label_features.iloc[valid_index],
             )
 
-            ModelFitClass = globals()["{}Fitter".format(model_type)]
-            model_fitter = ModelFitClass(X_train, y_train, X_valid, y_valid, params)
+            FoldFitClass = globals()["{}Fitter".format(model_type)]
+            model_fitter = FoldFitClass(X_train, y_train, X_valid, y_valid, params)
             model_fitter.fit()
             model_fitter.predict()
 
-            self.out_of_fold[valid_index] = model_fitter.y_predict_valid.reshape(-1)
-            self.scores.append(model_fitter.score())
+            out_of_fold[valid_index] = model_fitter.y_predict_valid.reshape(-1)
+            score = model_fitter.score()
+            print(score)
+            fold_scores.append(score)
 
-            y_predict = model_fitter.predict(test_features)
+            y_predict = model_fitter.model.predict(test_features)
 
-            self.prediction += y_predict
+            test_prediction += y_predict
 
-        self.prediction /= len(folds)
+        test_prediction /= folds.n_splits
+
+        self.out_of_fold = out_of_fold
+        self.test_prediction = test_prediction
+        self.fold_scores = fold_scores
 
 
-class ModelFitter(object):
+class FoldFitter(object):
     def __init__(self, X_train, y_train, X_valid, y_valid, params):
         self.X_train = X_train
         self.y_train = y_train
@@ -71,15 +78,13 @@ class ModelFitter(object):
         self.y_predict_valid = None
         self.y_predict = None
 
-        self.score = None
-
     def score(self):
-        return mean_absolute_error(self.y_valid, self.y_predict_valid)
+        return mean_absolute_error(self.y_valid.values, self.y_predict_valid)
 
 
-class LGBFitter(ModelFitter):
+class LGBFitter(FoldFitter):
     def __init__(self, X_train, y_train, X_valid, y_valid, params):
-        ModelFitter.__init__(self, X_train, y_train, X_valid, y_valid, params)
+        FoldFitter.__init__(self, X_train, y_train, X_valid, y_valid, params)
 
     def fit(self):
         model = lgb.LGBMRegressor(**self.params, n_estimators=50000, n_jobs=-1)
@@ -102,9 +107,9 @@ class LGBFitter(ModelFitter):
         )
 
 
-class XGBModelFitter(ModelFitter):
+class XGBFitter(FoldFitter):
     def __init__(self, X_train, y_train, X_valid, y_valid, params):
-        ModelFitter.__init__(self, X_train, y_train, X_valid, y_valid, params)
+        FoldFitter.__init__(self, X_train, y_train, X_valid, y_valid, params)
 
     def fit(self):
 
@@ -138,22 +143,23 @@ class XGBModelFitter(ModelFitter):
         )
 
 
-class NuSVRFitter(ModelFitter):
+class NuSVRFitter(FoldFitter):
     def __init__(self, X_train, y_train, X_valid, y_valid, params):
-        ModelFitter.__init__(self, X_train, y_train, X_valid, y_valid, params)
+        FoldFitter.__init__(self, X_train, y_train, X_valid, y_valid, params)
 
     def fit(self):
         model = NuSVR(**self.params)
         model.fit(self.X_train, self.y_train)
+        self.model = model
 
     def predict(self):
         model = self.model
         self.y_predict_valid = model.predict(self.X_valid).reshape(-1)
 
 
-class CatBoostFitter(ModelFitter):
+class CatBoostFitter(FoldFitter):
     def __init__(self, X_train, y_train, X_valid, y_valid, params):
-        ModelFitter.__init__(self, X_train, y_train, X_valid, y_valid, params)
+        FoldFitter.__init__(self, X_train, y_train, X_valid, y_valid, params)
 
     def fit(self):
         model = CatBoostRegressor(iterations=20000, eval_metric="MAE", **self.params)
@@ -165,7 +171,14 @@ class CatBoostFitter(ModelFitter):
             use_best_model=True,
             verbose=False,
         )
+        self.model = model
 
     def predict(self):
         model = self.model
         self.y_predict_valid = model.predict(self.X_valid)
+
+
+def cross_validation():
+    n_fold = 5
+    folds = KFold(n_splits=n_fold, shuffle=True, random_state=11)
+    return folds
